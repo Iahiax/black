@@ -1,0 +1,158 @@
+# export/export_gguf.py
+import os
+import json
+import argparse
+import numpy as np
+import torch
+import gguf
+from config import CyberCoreConfig
+
+QUANT_MAP = {
+    "f16": (gguf.GGMLQuantizationType.F16, 1),
+    "q4_0": (gguf.GGMLQuantizationType.Q4_0, 2),
+    "q8_0": (gguf.GGMLQuantizationType.Q8_0, 7),
+}
+
+def permute_for_gguf(w: np.ndarray, n_heads: int) -> np.ndarray:
+    """تحويل ترتيب RoPE من نمط PyTorch/HF إلى نمط GGUF القياسي"""
+    out_dim, in_dim = w.shape
+    head_dim = out_dim // n_heads
+    return (
+        w.reshape(n_heads, 2, head_dim // 2, in_dim)
+        .transpose(0, 2, 1, 3)
+        .reshape(out_dim, in_dim)
+    )
+
+def embed_tokenizer_into_gguf(writer: gguf.GGUFWriter, tok_path: str, cfg: CyberCoreConfig):
+    with open(tok_path, "r", encoding="utf-8") as f:
+        raw_tok_json = f.read()
+    tok_data = json.loads(raw_tok_json)
+
+    vocab = tok_data["model"]["vocab"]
+    tokens = [""] * cfg.vocab_size
+    token_types = [int(gguf.TokenType.NORMAL)] * cfg.vocab_size
+
+    for tok_str, tok_id in vocab.items():
+        if 0 <= tok_id < cfg.vocab_size:
+            tokens[tok_id] = tok_str
+
+    for added in tok_data.get("added_tokens", []):
+        tid = added.get("id", -1)
+        if 0 <= tid < cfg.vocab_size:
+            tokens[tid] = added.get("content", tokens[tid])
+            if added.get("special", False):
+                token_types[tid] = int(gguf.TokenType.CONTROL)
+
+    raw_merges = tok_data["model"].get("merges", [])
+    merges = [f"{m[0]} {m[1]}" if isinstance(m, list) else m for m in raw_merges]
+
+    writer.add_tokenizer_model("gpt2")
+    writer.add_tokenizer_pre("default")
+    writer.add_token_list(tokens)
+    writer.add_token_types(token_types)
+    if merges:
+        writer.add_token_merges(merges)
+    writer.add_bos_token_id(cfg.bos_token_id)
+    writer.add_eos_token_id(cfg.eos_token_id)
+    writer.add_pad_token_id(cfg.pad_token_id)
+    # حفظ ملف tokenizer.json كاملاً داخل GGUF ليكون ملفاً واحداً مكتفياً ذاتياً
+    writer.add_string("tokenizer.huggingface.json", raw_tok_json)
+
+def map_key_to_gguf(key: str) -> str | None:
+    if key == "embed_tokens.weight":
+        return "token_embd.weight"
+    if key == "norm.weight":
+        return "output_norm.weight"
+    if key == "lm_head.weight":
+        return "output.weight"
+    if key.startswith("layers."):
+        parts = key.split(".")
+        idx = parts[1]
+        sub = ".".join(parts[2:])
+        mapping = {
+            "input_layernorm.weight": f"blk.{idx}.attn_norm.weight",
+            "self_attn.q_proj.weight": f"blk.{idx}.attn_q.weight",
+            "self_attn.k_proj.weight": f"blk.{idx}.attn_k.weight",
+            "self_attn.v_proj.weight": f"blk.{idx}.attn_v.weight",
+            "self_attn.o_proj.weight": f"blk.{idx}.attn_output.weight",
+            "post_attention_layernorm.weight": f"blk.{idx}.ffn_norm.weight",
+            "mlp.gate_proj.weight": f"blk.{idx}.ffn_gate.weight",
+            "mlp.up_proj.weight": f"blk.{idx}.ffn_up.weight",
+            "mlp.down_proj.weight": f"blk.{idx}.ffn_down.weight",
+        }
+        return mapping.get(sub)
+    return None
+
+def export_to_gguf(
+    ckpt_path="checkpoints/cybercore_1.5b_inference.pt",
+    tok_path="tokenizer/out/tokenizer.json",
+    out_path="export/cybercore-1.5b-q8_0.gguf",
+    quant="q8_0"
+):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    qtype, file_type_id = QUANT_MAP[quant.lower()]
+
+    print(f"[1/3] تحميل الأوزان من {ckpt_path} ...")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    cfg = CyberCoreConfig(**ckpt["config"])
+    state_dict = ckpt["model"]
+
+    writer = gguf.GGUFWriter(out_path, arch="llama")
+    writer.add_name(cfg.model_name)
+    writer.add_file_type(file_type_id)
+    writer.add_context_length(cfg.max_seq_len)
+    writer.add_embedding_length(cfg.dim)
+    writer.add_block_count(cfg.n_layers)
+    writer.add_feed_forward_length(cfg.intermediate_size)
+    writer.add_head_count(cfg.n_heads)
+    writer.add_head_count_kv(cfg.n_kv_heads)
+    writer.add_layer_norm_rms_eps(cfg.rms_norm_eps)
+    writer.add_rope_dimension_count(cfg.dim // cfg.n_heads)
+    writer.add_rope_freq_base(cfg.rope_theta)
+    writer.add_vocab_size(cfg.vocab_size)
+    writer.add_bool("cybercore.tie_word_embeddings", cfg.tie_word_embeddings)
+
+    print("[2/3] دمج المُرمّز المخصص (Tokenizer) داخل ملف GGUF ...")
+    embed_tokenizer_into_gguf(writer, tok_path, cfg)
+
+    print(f"[3/3] تحويل وضغط الطبقات إلى GGUF ({quant.upper()}) بدون llama.cpp ...")
+    for key, tensor in state_dict.items():
+        if cfg.tie_word_embeddings and key == "lm_head.weight":
+            continue
+        gguf_name = map_key_to_gguf(key)
+        if gguf_name is None:
+            continue
+
+        arr = tensor.detach().cpu().float().numpy()
+        if gguf_name.endswith(".attn_q.weight"):
+            arr = permute_for_gguf(arr, cfg.n_heads)
+        elif gguf_name.endswith(".attn_k.weight"):
+            arr = permute_for_gguf(arr, cfg.n_kv_heads)
+
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+
+        # طبقات التطبيع 1D تبقى دائماً بدقة F32 للحفاظ على الاستقرار
+        if arr.ndim == 1:
+            writer.add_tensor(gguf_name, arr, raw_dtype=gguf.GGMLQuantizationType.F32)
+        elif qtype == gguf.GGMLQuantizationType.F16:
+            writer.add_tensor(gguf_name, arr.astype(np.float16), raw_dtype=qtype)
+        else:
+            quantized = gguf.quants.quantize(arr, qtype)
+            writer.add_tensor(gguf_name, quantized, raw_dtype=qtype)
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    size_gb = os.path.getsize(out_path) / (1024 ** 3)
+    print(f"[+] اكتمل التصدير! ملف GGUF جاهز: {out_path} ({size_gb:.2f} GB)")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="checkpoints/cybercore_1.5b_inference.pt")
+    parser.add_argument("--tok", type=str, default="tokenizer/out/tokenizer.json")
+    parser.add_argument("--out", type=str, default="export/cybercore-1.5b-q8_0.gguf")
+    parser.add_argument("--quant", type=str, default="q8_0", choices=["q8_0", "q4_0", "f16"])
+    args = parser.parse_args()
+    export_to_gguf(args.ckpt, args.tok, args.out, args.quant)
