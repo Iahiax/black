@@ -12,9 +12,15 @@ TOR_PROXIES = {
     "https": "socks5h://127.0.0.1:9050",
 }
 
+
 class AutonomousHarvester:
-    def __init__(self, out_file="data/raw/corpus_all.txt", tor_control_port=9051, tor_password=""):
-        os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    def __init__(
+        self,
+        out_file: str = "data/raw/corpus_all.txt",
+        tor_control_port: int = 9051,
+        tor_password: str = "",
+    ):
+        os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
         self.out_file = out_file
         self.seen_hashes = set()
         self.tor_control_port = tor_control_port
@@ -31,18 +37,24 @@ class AutonomousHarvester:
 
     def _save_clean_doc(self, text: str, env_tag: str = ""):
         clean = "\n".join(line.rstrip() for line in text.splitlines() if line.strip())
-        if len(clean) < 150:
+        if len(clean) < 100:
             return
         h = hashlib.sha256(clean.encode("utf-8")).hexdigest()
         if h in self.seen_hashes:
             return
         self.seen_hashes.add(h)
+
+        # منع تكرار وسوم البداية والنهاية عند حفظ عينات الحوار والأدوات
+        clean = clean.removeprefix("<|bos|>").removesuffix("<|eos|>").strip()
+        prefix = f"{env_tag}\n" if (env_tag and not clean.startswith("<|usr|>")) else ""
+
         with open(self.out_file, "a", encoding="utf-8") as f:
-            prefix = f"{env_tag}\n" if env_tag else ""
             f.write(f"<|bos|>{prefix}{clean}<|eos|>\n")
 
     def scrape_url(self, url: str, use_tor: bool = False, env_tag: str = ""):
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/128.0"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/128.0"
+        }
         try:
             proxies = TOR_PROXIES if use_tor else None
             r = requests.get(url, headers=headers, proxies=proxies, timeout=25)
@@ -71,7 +83,7 @@ class AutonomousHarvester:
                         pass
 
     def inject_specialized_env_knowledge(self):
-        """حقن المعرفة التأسيسية الدقيقة لبيئات iSH و Segfault.net و Kali و Ubuntu"""
+        """حقن المعرفة التأسيسية الدقيقة لبيئات iSH و Segfault.net و Kali و Ubuntu وأمثلة البحث الحي"""
         seed_docs = [
             ("<|env_ish|>", """# iSH Shell (Alpine Linux x86 on iOS) Best Practices
 - Package manager: apk add --no-cache python3 py3-pip git openssh-client tmux curl nmap
@@ -87,18 +99,43 @@ class AutonomousHarvester:
 
             ("<|env_kali|>", """# Kali Linux Offensive & Defensive Automation
 - Package manager: apt update && apt install -y python3-scapy python3-pwntools nmap masscan gobuster sqlmap metasploit-framework.
-- Raw sockets & packet crafting: run Python scapy/raw-socket tools with sudo or CAP_NET_RAW (setcap cap_net_raw+ep $(readlink -f $(which python3)))."""),
+- Raw sockets & packet crafting: run Python scapy/raw-socket tools with sudo or CAP_NET_RAW (setcap cap_net_raw+ep $(readlink -f$(which python3)))."""),
 
             ("<|env_ubuntu|>", """# Ubuntu Server Security & Infrastructure Hardening
 - Service & firewall automation: ufw, nftables, systemd timers, fail2ban, journalctl analysis via Python subprocess and systemd-python.
-- Isolated execution: deploy Docker rootless containers for running untrusted security tools and self-testing AI-generated Python scripts.""")
+- Isolated execution: deploy Docker rootless containers for running untrusted security tools and self-testing AI-generated Python scripts."""),
+
+            ("<|web_search|>", """<|usr|><|env_kali|> ابحث عن أحدث ثغرة OpenSSH واكتب سكربت بايثون لفحص الإصدار.<|eos|>
+<|ast|><|web_search|> latest OpenSSH CVE version check python<|eos|>
+<|obs|>=== نتائج الإنترنت العادي ===
+OpenSSH banner grabbing via socket on port 22 reveals version string.<|eos|>
+<|ast|>إليك سكربت بايثون لفحص إصدار OpenSSH عبر سحب الـ Banner:
+```python
+import socket
+
+def check_ssh(host, port=22):
+    with socket.create_connection((host, port), timeout=5) as s:
+        print(s.recv(256).decode(errors="ignore").strip())
+```<|eos|>"""),
+
+            ("<|tor_search|>", """<|usr|><|env_segfault|> ابحث في الشبكة المظلمة عن أدلة استخبارات التهديدات السيبرانية.<|eos|>
+<|ast|><|tor_search|> threat intelligence cyber security feeds<|eos|>
+<|obs|>=== نتائج الشبكة المظلمة عبر Tor ===
+تم العثور على مصادر استخبارات تهديدات على شبكة .onion.<|eos|>
+<|ast|>بناءً على نتائج Tor، هذه هي المصادر النشطة ويمكنك أتمتة سحبها عبر torsocks داخل /sec.<|eos|>"""),
         ]
         for tag, doc in seed_docs:
             self._save_clean_doc(doc, env_tag=tag)
+        print(f"[+] تم حقن {len(seed_docs)} وثيقة تأسيسية (البيئات الأربع + البحث العادي والمظلم) في {self.out_file}")
+
 
 if __name__ == "__main__":
     h = AutonomousHarvester()
     h.inject_specialized_env_knowledge()
     # مثال للزحف العادي والمظلم (أضف روابط .onion وقائمة المستودعات الخاصة بك)
-    h.scrape_url("https://wiki.alpinelinux.org/wiki/Alpine_Package_Keeper", use_tor=False, env_tag="<|env_ish|>")
+    h.scrape_url(
+        "https://wiki.alpinelinux.org/wiki/Alpine_Package_Keeper",
+        use_tor=False,
+        env_tag="<|env_ish|>",
+    )
     # h.scrape_url("http://exampleonionaddress.onion/forum", use_tor=True, env_tag="<|tor_search|>")
