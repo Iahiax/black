@@ -23,9 +23,8 @@ def precompute_rope_cache(seq_len: int, head_dim: int, theta: float = 500000.0, 
     return emb.cos(), emb.sin()
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     cos = cos.unsqueeze(0).unsqueeze(1)
@@ -59,7 +58,6 @@ class GroupedQueryAttention(nn.Module):
             v = torch.cat([past_kv[1], v], dim=2)
 
         new_kv = (k, v) if use_cache else None
-
         k_rep = k.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else k
         v_rep = v.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else v
 
@@ -109,9 +107,12 @@ class CyberCoreZero(nn.Module):
         self.norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
 
+        self.apply(self._init_weights)
+        if cfg.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
         self.register_buffer("rope_cos", None, persistent=False)
         self.register_buffer("rope_sin", None, persistent=False)
-        self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -126,6 +127,27 @@ class CyberCoreZero(nn.Module):
                 device=device
             )
             self.rope_cos, self.rope_sin = cos, sin
+
+    def _chunked_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor, chunk_size: int = 128) -> torch.Tensor:
+        """حساب الخسارة على شرائح صغيرة لمنع انفجار ذاكرة VRAM أثناء تدريب 1.5B على Colab"""
+        hidden_flat = hidden.reshape(-1, hidden.size(-1))
+        targets_flat = targets.reshape(-1)
+        valid_tokens = (targets_flat != self.cfg.pad_token_id).sum().clamp(min=1)
+
+        def loss_fn(h_chunk, t_chunk):
+            logits_chunk = self.lm_head(h_chunk).float()
+            return F.cross_entropy(logits_chunk, t_chunk, ignore_index=self.cfg.pad_token_id, reduction="sum")
+
+        total_loss = hidden_flat.new_zeros((), dtype=torch.float32)
+        for i in range(0, hidden_flat.size(0), chunk_size):
+            h_c = hidden_flat[i : i + chunk_size]
+            t_c = targets_flat[i : i + chunk_size]
+            if self.training and self.gradient_checkpointing:
+                total_loss = total_loss + checkpoint(loss_fn, h_c, t_c, use_reentrant=False)
+            else:
+                total_loss = total_loss + loss_fn(h_c, t_c)
+
+        return total_loss / valid_tokens
 
     def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None, past_kvs=None, use_cache: bool = False):
         bsz, seqlen = input_ids.shape
@@ -148,21 +170,21 @@ class CyberCoreZero(nn.Module):
                 if use_cache:
                     new_kvs.append(kv)
 
-        logits = self.lm_head(self.norm(x))
-        loss = None
+        x = self.norm(x)
+
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, self.cfg.vocab_size),
-                targets.view(-1),
-                ignore_index=self.cfg.pad_token_id
-            )
-        return (logits, loss, new_kvs) if use_cache else (logits, loss)
+            loss = self._chunked_cross_entropy(x, targets)
+            return None, loss
+
+        logits = self.lm_head(x)
+        return (logits, None, new_kvs) if use_cache else (logits, None)
 
     @torch.inference_mode()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 512, temperature: float = 0.2, top_p: float = 0.9, eos_token_id: int = 2):
+    def generate_stream(self, input_ids: torch.Tensor, max_new_tokens: int = 512, temperature: float = 0.2, top_p: float = 0.9):
+        """توليد متدفق (Token-by-Token) لتجربة سريعة ومباشرة على CPU"""
         past_kvs = None
-        generated = input_ids
         next_input = input_ids
+        eos_id = self.cfg.eos_token_id
 
         for _ in range(max_new_tokens):
             logits, _, past_kvs = self(next_input, past_kvs=past_kvs, use_cache=True)
@@ -179,15 +201,15 @@ class CyberCoreZero(nn.Module):
                 mask[..., 1:] = mask[..., :-1].clone()
                 mask[..., 0] = False
                 sorted_logits[mask] = float("-inf")
-                final_probs = F.softmax(sorted_logits, dim=-1)
-                sampled = torch.multinomial(final_probs, num_samples=1)
+                sampled = torch.multinomial(F.softmax(sorted_logits, dim=-1), num_samples=1)
                 next_token = sorted_indices.gather(-1, sampled)
 
-            generated = torch.cat([generated, next_token], dim=1)
-            next_input = next_token
-            if next_token.item() == eos_token_id:
+            token_id = next_token.item()
+            if token_id == eos_id:
                 break
-        return generated
+            yield token_id
+            next_input = next_token
 
     def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+        # حساب المعاملات الفريدة فقط عند تفعيل Tied Embeddings
+        return sum(p.numel() for p in {id(p): p for p in self.parameters()}.values())
