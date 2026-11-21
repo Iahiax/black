@@ -1,5 +1,6 @@
 # inference/cpu_runner.py
 import os
+import re
 import gc
 import sys
 import platform
@@ -11,6 +12,8 @@ import gguf
 from tokenizers import Tokenizer
 from config import CyberCoreConfig
 from model.architecture import CyberCoreZero
+from inference.search_engine import LiveSearchEngine
+
 
 def configure_cpu_backend():
     arch = platform.machine().lower()
@@ -18,6 +21,7 @@ def configure_cpu_backend():
     threads = max(1, os.cpu_count() or 4)
     torch.set_num_threads(threads)
     return threads, torch.backends.quantized.engine
+
 
 def _read_gguf_kv(reader: gguf.GGUFReader, key: str, default=None):
     field = reader.get_field(key)
@@ -30,8 +34,8 @@ def _read_gguf_kv(reader: gguf.GGUFReader, key: str, default=None):
         return bytes(val).decode("utf-8")
     return val.item()
 
+
 def unpermute_from_gguf(w: np.ndarray, n_heads: int) -> np.ndarray:
-    """إرجاع ترتيب RoPE من نمط GGUF إلى نمط PyTorch"""
     out_dim, in_dim = w.shape
     head_dim = out_dim // n_heads
     return (
@@ -39,6 +43,7 @@ def unpermute_from_gguf(w: np.ndarray, n_heads: int) -> np.ndarray:
         .transpose(0, 2, 1, 3)
         .reshape(out_dim, in_dim)
     )
+
 
 def map_gguf_to_pt_key(name: str) -> str | None:
     if name == "token_embd.weight":
@@ -65,14 +70,15 @@ def map_gguf_to_pt_key(name: str) -> str | None:
         return mapping.get(sub)
     return None
 
+
 class CPURunner:
     def __init__(self, gguf_path="export/cybercore-1.5b-q8_0.gguf", tok_path=None, quantize_int8=True):
         threads, engine = configure_cpu_backend()
-        print(f"[*] تحميل ملف GGUF مباشرة على CPU (بدون llama.cpp) | الخيوط: {threads} | المحرك: {engine}")
+        print(f"[*] تحميل ملف GGUF مباشرة على CPU | الخيوط: {threads} | المحرك: {engine}")
 
+        self.search_engine = LiveSearchEngine()
         reader = gguf.GGUFReader(gguf_path)
 
-        # استخراج الإعدادات من ترويسة ملف GGUF
         cfg = CyberCoreConfig(
             model_name=str(_read_gguf_kv(reader, "general.name", "CyberCore-Zero-1.5B")),
             vocab_size=int(_read_gguf_kv(reader, "llama.vocab_size", 65536)),
@@ -90,16 +96,14 @@ class CPURunner:
             pad_token_id=int(_read_gguf_kv(reader, "tokenizer.ggml.pad_token_id", 0)),
         )
 
-        # تحميل المُرمّز المدمج داخل ملف GGUF تلقائياً
         embedded_tok = _read_gguf_kv(reader, "tokenizer.huggingface.json")
         if embedded_tok:
             self.tokenizer = Tokenizer.from_str(embedded_tok)
         elif tok_path and os.path.exists(tok_path):
             self.tokenizer = Tokenizer.from_file(tok_path)
         else:
-            raise FileNotFoundError("لم يُعثر على المُرمّز داخل ملف GGUF؛ مرر --tok لمسار tokenizer.json.")
+            raise FileNotFoundError("لم يُعثر على المُرمّز داخل GGUF؛ مرر --tok لمسار tokenizer.json.")
 
-        # فك ضغط أوزان GGUF إلى PyTorch
         state_dict = {}
         for t in reader.tensors:
             pt_key = map_gguf_to_pt_key(t.name)
@@ -138,10 +142,23 @@ class CPURunner:
             self.model = torch.ao.quantization.quantize_dynamic(self.model, {nn.Linear}, dtype=torch.qint8)
             gc.collect()
 
-        print(f"[+] تم تحميل {cfg.model_name} من ملف GGUF بنجاح وهو جاهز على CPU.")
+        tor_status = "متصل (9050)" if self.search_engine.is_tor_running() else "غير متصل"
+        print(f"[+] تم تحميل {cfg.model_name} (GGUF) بنجاح | حالة Tor: {tor_status}")
 
-    def generate_text(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.2, stream: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.2,
+        stream: bool = False,
+        keep_special_tokens: bool = False,
+    ) -> str:
         ids = self.tokenizer.encode(prompt).ids
+        # قص البداية إذا تجاوز السياق المسموح
+        max_ctx = self.model.cfg.max_seq_len - max_new_tokens
+        if len(ids) > max_ctx and max_ctx > 0:
+            ids = ids[-max_ctx:]
+
         input_tensor = torch.tensor([ids], dtype=torch.long)
         generated_ids = []
         printed_text = ""
@@ -149,7 +166,7 @@ class CPURunner:
         for token_id in self.model.generate_stream(input_tensor, max_new_tokens=max_new_tokens, temperature=temperature):
             generated_ids.append(token_id)
             if stream:
-                full_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                full_text = self.tokenizer.decode(generated_ids, skip_special_tokens=not keep_special_tokens)
                 if not full_text.endswith("\ufffd"):
                     delta = full_text[len(printed_text):]
                     if delta:
@@ -157,7 +174,7 @@ class CPURunner:
                         sys.stdout.flush()
                         printed_text = full_text
 
-        final_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        final_text = self.tokenizer.decode(generated_ids, skip_special_tokens=not keep_special_tokens)
         if stream:
             delta = final_text[len(printed_text):]
             if delta:
@@ -166,25 +183,107 @@ class CPURunner:
             print()
         return final_text
 
+    def generate_with_live_search(
+        self,
+        prompt: str,
+        max_new_tokens: int = 768,
+        temperature: float = 0.2,
+        max_search_rounds: int = 3,
+        stream: bool = True,
+    ) -> str:
+        """يسمح لنموذج GGUF بطلب البحث في الإنترنت العادي أو المظلم تلقائياً ثم إكمال الإجابة"""
+        current_prompt = prompt
+        final_reply = ""
+
+        for round_idx in range(max_search_rounds + 1):
+            raw_reply = self.generate_text(
+                current_prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                stream=stream,
+                keep_special_tokens=True,
+            )
+
+            web_match = re.search(r"<\|web_search\|>\s*([^\n<]+)", raw_reply)
+            tor_match = re.search(r"<\|tor_search\|>\s*([^\n<]+)", raw_reply)
+
+            if round_idx < max_search_rounds and (web_match or tor_match):
+                if tor_match:
+                    q = tor_match.group(1).strip()
+                    print(f"\n[*] [GGUF -> Tor Search] جارٍ البحث في الشبكة المظلمة عن: {q} ...")
+                    obs = self.search_engine.search_dark_web(q, max_results=5, fetch_top_onion=True)
+                else:
+                    q = web_match.group(1).strip()
+                    print(f"\n[*] [GGUF -> Web Search] جارٍ البحث في الإنترنت العادي عن: {q} ...")
+                    obs = self.search_engine.search_surface_web(q, max_results=5)
+
+                print(f"[+] تم جلب البيانات الحية ({len(obs)} حرف) وحقنها في سياق GGUF...\n")
+                current_prompt += f"{raw_reply}<|eos|>\n<|obs|>\n{obs[:2500]}\n<|eos|>\n<|ast|>"
+                if stream:
+                    print("[CyberCore-Zero 1.5B]> ", end="", flush=True)
+                continue
+
+            final_reply = re.sub(r"<\|[^|]+\|>", "", raw_reply).strip()
+            break
+
+        return final_reply
+
+
 def interactive_chat(gguf_path, tok_path=None, no_int8=False):
     runner = CPURunner(gguf_path=gguf_path, tok_path=tok_path, quantize_int8=not no_int8)
-    print("\n=== CyberCore-Zero 1.5B GGUF CPU Shell (اكتب exit للخروج أو /env لتغيير البيئة) ===")
-    env = input("اختر البيئة الافتراضية [ish / segfault / kali / ubuntu] (افتراضي kali): ").strip() or "kali"
+    print("\n=== CyberCore-Zero 1.5B GGUF CPU Shell ===")
+    print("الأوامر المتاحة:")
+    print("  /web <استعلام أو رابط>     -> بحث حي في الإنترنت العادي ثم التحليل بالنموذج")
+    print("  /tor <استعلام أو .onion>   -> بحث حي في الشبكة المظلمة عبر Tor ثم التحليل بالنموذج")
+    print("  /tor_ip                    -> فحص اتصال Tor وتجديد الهوية")
+    print("  /env <ish|segfault|kali|ubuntu> -> تبديل البيئة")
+    print("  exit                       -> خروج")
+
+    env = input("\nاختر البيئة الافتراضية [kali]: ").strip() or "kali"
 
     while True:
         user_msg = input(f"\n[{env}] أنت> ").strip()
+        if not user_msg:
+            continue
         if user_msg.lower() in {"exit", "quit"}:
             break
+
         if user_msg.startswith("/env "):
             env = user_msg.split(" ", 1)[1].strip()
             print(f"[*] تم التبديل إلى بيئة: {env}")
             continue
+
+        if user_msg == "/tor_ip":
+            print("[*]", runner.search_engine.check_tor_ip())
+            print("[*]", runner.search_engine.renew_tor_identity())
+            continue
+
+        injected_obs = ""
+        clean_task = user_msg
+
+        if user_msg.startswith("/web "):
+            query = user_msg[5:].strip()
+            print(f"[*] جارٍ البحث في الإنترنت العادي عن: {query} ...")
+            injected_obs = runner.search_engine.search_surface_web(query, max_results=5)
+            clean_task = f"بناءً على نتائج البحث التالية حول ({query})، قدم تحليلاً تقنياً أو كود بايثون عملي:"
+        elif user_msg.startswith("/tor "):
+            query = user_msg[5:].strip()
+            print(f"[*] جارٍ البحث في الشبكة المظلمة (Tor) عن: {query} ...")
+            injected_obs = runner.search_engine.search_dark_web(query, max_results=5, fetch_top_onion=True)
+            clean_task = f"بناءً على بيانات الشبكة المظلمة التالية حول ({query})، لخص النتائج وقدم التحليل المطلوب:"
+
         prompt = (
-            f"<|bos|><|sys|>أنت CyberCore-Zero 1.5B خبير الأمن السيبراني والبايثون لبيئة {env}.<|eos|>\n"
-            f"<|usr|><|env_{env}|> {user_msg}<|eos|>\n<|ast|>"
+            f"<|bos|><|sys|>أنت CyberCore-Zero 1.5B خبير الأمن السيبراني والبايثون لبيئة {env}. "
+            f"يمكنك استخدام <|web_search|> للبحث في الإنترنت العادي أو <|tor_search|> للبحث عبر Tor عند الحاجة.<|eos|>\n"
+            f"<|usr|><|env_{env}|> {clean_task}<|eos|>\n"
         )
+        if injected_obs:
+            prompt += f"<|obs|>\n{injected_obs[:2800]}\n<|eos|>\n"
+        prompt += "<|ast|>"
+
         print("\n[CyberCore-Zero 1.5B]> ", end="", flush=True)
-        runner.generate_text(prompt, max_new_tokens=768, temperature=0.2, stream=True)
+        runner.generate_with_live_search(prompt, max_new_tokens=768, temperature=0.2, stream=True)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
