@@ -2,107 +2,126 @@
 import os
 import math
 import time
+import argparse
 import numpy as np
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from config import CyberCoreConfig
+from config import get_config
 from model.architecture import CyberCoreZero
 
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+
 def get_batch(data_memmap, batch_size, seq_len, device):
-    ix = torch.randint(len(data_memmap) - seq_len - 1, (batch_size,))
+    max_start = len(data_memmap) - seq_len - 1
+    if max_start <= 0:
+        raise ValueError("ملف train.bin أصغر من seq_len! أضف المزيد من البيانات عبر harvester.py.")
+    ix = torch.randint(max_start, (batch_size,))
     x = torch.stack([torch.from_numpy(data_memmap[i : i + seq_len].astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy(data_memmap[i + 1 : i + 1 + seq_len].astype(np.int64)) for i in ix])
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
     if step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
+        return max_lr * (step + 1) / max(1, warmup_steps)
     if step >= max_steps:
         return min_lr
-    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
+    ratio = (step - warmup_steps) / max(1, (max_steps - warmup_steps))
+    return min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (max_lr - min_lr)
 
-def train(data_path="data/train.bin", ckpt_dir="checkpoints", resume_path=None, max_steps=10000):
-    ddp = int(os.environ.get("RANK", -1)) != -1
-    if ddp:
-        dist.init_process_group(backend="nccl")
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        device = f"cuda:{local_rank}"
-        torch.cuda.set_device(device)
-        master_process = rank == 0
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", type=str, default="colab_t4", choices=["colab_t4", "colab_a100", "heavy_7b"])
+    parser.add_argument("--data_path", type=str, default="data/train.bin")
+    parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
+    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--seq_len", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=16)
+    parser.add_argument("--save_every", type=int, default=250)
+    args = parser.parse_args()
+
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+
+    cfg = get_config(args.profile)
+    model = CyberCoreZero(cfg, gradient_checkpointing=True).to(device)
+    print(f"[*] الوضع: {args.profile} | المعاملات: {model.count_parameters()/1e6:.1f}M | الجهاز: {device}")
+
+    if device == "cuda" and HAS_BNB:
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+        print("[+] تم تفعيل 8-bit AdamW لتقليل استهلاك VRAM على Colab.")
     else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        master_process = True
+        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
 
-    os.makedirs(ckpt_dir, exist_ok=True)
-    cfg = CyberCoreConfig()
-    model = CyberCoreZero(cfg).to(device)
+    # الاستكمال التلقائي (Auto-Resume) في حال فصلت جلسة Google Colab
+    latest_ckpt = os.path.join(args.ckpt_dir, "cybercore_latest.pt")
+    start_step = 0
+    if os.path.exists(latest_ckpt):
+        ckpt = torch.load(latest_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        start_step = ckpt.get("step", 0) + 1
+        print(f"[+] استكمال تلقائي من الخطوة {start_step} من: {latest_ckpt}")
 
-    if resume_path and os.path.exists(resume_path):
-        model.load_state_dict(torch.load(resume_path, map_location=device))
-        if master_process:
-            print(f"[+] تم استكمال التدريب من النقطة: {resume_path}")
+    data = np.memmap(args.data_path, dtype=np.uint32, mode="r")
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and not use_bf16))
 
-    if master_process:
-        print(f"[*] تهيئة CyberCore-Zero من الصفر | عدد المعاملات: {model.count_parameters()/1e9:.2f}B")
-
-    # تسريع PyTorch 2.x
-    if torch.cuda.is_available():
-        model = torch.compile(model)
-    if ddp:
-        model = DDP(model, device_ids=[local_rank])
-
-    raw_model = model.module if ddp else model
-    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=torch.cuda.is_available())
-
-    data = np.memmap(data_path, dtype=np.uint32, mode="r")
-    seq_len = 2048      # ارفعه تدريجياً إلى 8192 ثم 16384 في المراحل اللاحقة
-    batch_size = 4
-    grad_accum = 16     # Batch فعلي = batch_size * grad_accum * num_gpus
-
-    scaler = torch.amp.GradScaler("cuda", enabled=False) # BF16 لا يحتاج Scaler
+    model.train()
     t0 = time.time()
 
-    for step in range(max_steps):
-        lr = get_lr(step, warmup_steps=500, max_steps=max_steps, max_lr=3e-4, min_lr=3e-5)
+    for step in range(start_step, args.max_steps):
+        lr = get_lr(step, warmup_steps=200, max_steps=args.max_steps, max_lr=3e-4, min_lr=3e-5)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
         loss_accum = 0.0
 
-        for _ in range(grad_accum):
-            x, y = get_batch(data, batch_size, seq_len, device)
-            with torch.amp.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.bfloat16):
+        for _ in range(args.grad_accum):
+            x, y = get_batch(data, args.batch_size, args.seq_len, device)
+            if device == "cuda":
+                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                    _, loss = model(x, y)
+                    loss = loss / args.grad_accum
+                scaler.scale(loss).backward()
+            else:
                 _, loss = model(x, y)
-                loss = loss / grad_accum
-            loss.backward()
+                loss = loss / args.grad_accum
+                loss.backward()
             loss_accum += loss.item()
 
-        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
-        optimizer.step()
+        if device == "cuda":
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-        if master_process and (step % 50 == 0 or step == max_steps - 1):
+        if step % 20 == 0 or step == args.max_steps - 1:
             dt = time.time() - t0
             t0 = time.time()
-            print(f"Step {step:5d} | Loss: {loss_accum:.4f} | LR: {lr:.2e} | Time: {dt:.2f}s")
+            print(f"Step {step:5d}/{args.max_steps} | Loss: {loss_accum:.4f} | LR: {lr:.2e} | Time: {dt:.2f}s")
 
-        if master_process and step > 0 and step % 1000 == 0:
-            save_file = os.path.join(ckpt_dir, f"cybercore_step_{step}.pt")
-            state = raw_model._orig_mod.state_dict() if hasattr(raw_model, "_orig_mod") else raw_model.state_dict()
-            torch.save(state, save_file)
-            print(f"[+] حفظ نقطة التفتيش: {save_file}")
-
-    if master_process:
-        final_file = os.path.join(ckpt_dir, "cybercore_final.pt")
-        state = raw_model._orig_mod.state_dict() if hasattr(raw_model, "_orig_mod") else raw_model.state_dict()
-        torch.save(state, final_file)
-
-    if ddp:
-        dist.destroy_process_group()
+        if (step > 0 and step % args.save_every == 0) or step == args.max_steps - 1:
+            payload = {
+                "step": step,
+                "config": cfg.to_dict(),
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            torch.save(payload, latest_ckpt)
+            # حفظ نسخة خفيفة للتشغيل المباشر على CPU بدون حالة المحسّن (Optimizer)
+            infer_path = os.path.join(args.ckpt_dir, "cybercore_inference.pt")
+            torch.save({"config": cfg.to_dict(), "model": {k: v.half().cpu() for k, v in model.state_dict().items()}}, infer_path)
+            print(f"[+] تم الحفظ في {latest_ckpt} + نسخة التشغيل الخفيفة في {infer_path}")
 
 if __name__ == "__main__":
-    train()
+    main()
